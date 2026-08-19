@@ -1,0 +1,24 @@
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 数据集（体积巨大，绝不入库）=====
+dataset/*.jsonl
+dataset/*.json
+dataset/*.parquet
+
+# ===== 训练产物 =====
+out/
+checkpoints/
+*.pth
+*.pt
+
+# ===== 临时/验证脚本 =====
+verify.py
+*.tmp
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
