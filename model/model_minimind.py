@@ -1,10 +1,63 @@
 from transformers import PretrainedConfig
+import math
+import torch
 
 class MiniMindConfig(PretrainedConfig):
-    def __init__(self, vocab_size=30522, hidden_size=768, num_hidden_layers=12, num_attention_heads=12, intermediate_size=3072, **kwargs):
+    model_type = "minimind"
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
-        self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.intermediate_size = intermediate_size
+        self.use_moe = use_moe
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.vocab_size = kwargs.get("vocab_size", 6400)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.flash_attn = kwargs.get("flash_attn", True)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
+        self.hidden_act = kwargs.get("hidden_act", 'silu')
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.rope_theta = kwargs.get("rope_theta", 1e6)
+        # todo
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 2048,
+            "attention_factor": 1.0,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
+        ### MoE specific configs (ignored if use_moe = False)
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+
+class RMSNorm(torch.nn.Module):
+    # x/sqrt(variance + epsilon)*gamma 残差结构本身已经"平移不变"，均值偏移会被残差吸收——所以减均值这步是冗余的
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.variance_epsilon = eps
+        # 融合算子优雅降级：torch>=2.4 提供 F.rms_norm（单 kernel，约 4.7x 加速）
+        # 检测一次即可，避免每次 forward 重复开销
+        self._use_fused = hasattr(torch.nn.functional, 'rms_norm')
+
+    def norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+
+    def forward(self, x):
+        if self._use_fused:
+            # 融合分支：单 kernel 一次读完 x、算完写回，零中间张量
+            return torch.nn.functional.rms_norm(
+                x, (self.weight.shape[0],), self.weight, self.variance_epsilon
+            )
+        # 手写回退分支：fp32 计算保证精度，再转回输入精度
+        return (self.weight * self.norm(x.float())).type_as(x)
