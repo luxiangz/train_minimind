@@ -1,13 +1,9 @@
 import os
 import sys
-
-from sympy import im
-
-from dataset.lm_dataset import PretrainDataset
-from model.model_minimind import MiniMindConfig
-
+import time
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 
 import datasets
 import argparse
@@ -17,10 +13,96 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 from torch.nn.parallel import DistributedDataParallel
+from dataset.lm_dataset import PretrainDataset
+from model.model_minimind import MiniMindConfig
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    pass
+    start_time = time.time()
+    last_step = start_step
+    for step, (input_ids, labels) in enumerate(loader, start=start_step+1):
+        step_start_time = time.time()      # 端到端 step 计时起点
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        last_step =step
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        with autocast_ctx:
+            fwd_time_start = time.time()     # 前向计时起点
+            res = model(input_ids,labels = labels)
+            loss = res.loss + res.aux_loss
+            loss = loss / args.accumulation_steps
+        fwd_time = time.time() - fwd_time_start      # 前向耗时
+
+        bwd_time_start = time.time()         # 反向计时起点
+        scaler.scale(loss).backward()    
+        bwd_time = time.time() - bwd_time_start      # 反向耗时
+
+        model_time = fwd_time + bwd_time             # 模型总耗时 = 前向 + 反向
+
+        if step % args.accumulation_steps == 0:
+            # 还原梯度 + 检查 inf/nan
+            scaler.unscale_(optimizer)
+            # 按照全局范数裁剪梯度
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # 检查后更新梯度
+            scaler.step(optimizer)
+            # 根据前面的结果 动态调整缩放系数 k
+            scaler.update()
+            # 清空梯度
+            optimizer.zero_grad(set_to_none=True)
+        step_end_time = time.time()      # 端到端 step 计时终点
+        step_time = step_end_time - step_start_time      # 端到端 step 耗时
+        batch_count = len(input_ids)                     # 本 step 的 batch 大小（样本数）
+        model_ratio = model_time / max(step_time, 1e-9)  # 模型计算占端到端比例
+
+        # 每个 step 都用 wandb 记录性能指标
+        if wandb:
+            wandb.log({
+                "batch_count": batch_count,          # 每 step batch 数（样本数）
+                "step_time_s": step_time,            # 端到端 step 耗时（秒）
+                "model_time_s": model_time,          # 模型总耗时（前向+反向，秒）
+                "fwd_time_s": fwd_time,              # 前向耗时（秒）
+                "bwd_time_s": bwd_time,              # 反向耗时（秒）
+                "fwd_ratio": fwd_time / model_time,  # 前向占模型耗时比例
+                "model_time_ratio": model_ratio,     # 模型计算占端到端比例
+            })
+
+        if step % args.log_interval == 0 or step == iters:
+            spend_time = time.time() - start_time
+            current_loss = loss.item() * args.accumulation_steps
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_logits_loss = current_loss - current_aux_loss
+            current_lr = optimizer.param_groups[-1]['lr']
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            Logger(f'  [Perf] batch={batch_count}, step={step_time*1000:.1f}ms, fwd={fwd_time*1000:.1f}ms, bwd={bwd_time*1000:.1f}ms, model_ratio={model_ratio*100:.1f}%')
+            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+        # 保存模型
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+            model.eval()
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            model.train()
+            del state_dict
+
+        del input_ids, labels, res, loss
+
+    if last_step > start_step and last_step % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -61,7 +143,7 @@ if __name__ == "__main__":
     # 设置混合精度
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
 
     # 配置wandb
     wandb = None
@@ -78,7 +160,7 @@ if __name__ == "__main__":
     # DDP 多卡时，每张卡由一个进程驱动，数据必须分成 N 份、每卡一份、互不重叠
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     # GradScaler（梯度缩放器）fp16 训练时用"放大梯度再更新"来防止梯度下溢，bf16 时不需要（禁用）
-    scaler = torch.amp.GradScaler(device_type=device_type, enabled=(args.dtype == 'float16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     # 从ckp回复状态
