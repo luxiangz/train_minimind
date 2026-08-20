@@ -247,7 +247,7 @@ if __name__ == "__main__":
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
-    # ========== 9. 清理分布进程 ==========
+    # 清理分布进程
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
